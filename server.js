@@ -55,6 +55,11 @@ function requireRole(requiredRoles) {
 const cors = require('cors');
 app.use(cors());
 
+app.use((req, res, next) => {
+    console.log(`[${new Date().toISOString()}] ${req.method} ${req.originalUrl}`);
+    next();
+});
+
 // Test database connection
 async function testConnection() {
     try {
@@ -122,17 +127,28 @@ app.post('/api/register', async (req, res) => {
     }
 });
 
-// POST /api/login
 app.post('/api/login', async (req, res) => {
     try {
         const { email, password } = req.body;
+        
+        console.log('=== LOGIN ATTEMPT ===');
+        console.log('Email:', email);
+        console.log('Password received:', password);
 
         if (!email || !password) return res.status(400).json({ error: 'Email and password required' });
 
         const user = await User.findOne({ where: { email } });
+        console.log('User found:', user ? 'YES' : 'NO');
+        if (user) {
+            console.log('User passwordHash:', user.passwordHash);
+            console.log('Hash length:', user.passwordHash?.length);
+        }
+        
         if (!user) return res.status(401).json({ error: 'Invalid email or password' });
 
         const isValid = await bcrypt.compare(password, user.passwordHash);
+        console.log('Password valid:', isValid);
+        
         if (!isValid) return res.status(401).json({ error: 'Invalid email or password' });
 
         const token = jwt.sign(
@@ -148,9 +164,9 @@ app.post('/api/login', async (req, res) => {
     }
 });
 
-// ---------------------------
-// USER, RESIDENT, INCIDENT ROUTES
-// ---------------------------
+// -----
+// USERS
+// -----
 
 // GET /api/users
 app.get('/api/users', requireAuth, requireRole('RD'), async (req, res) => {
@@ -182,6 +198,77 @@ app.get('/api/users/:id', requireAuth, requireRole('RD'), async (req, res) => {
     }
 });
 
+// PUT /api/users/:id
+app.put('/api/users/:id', requireAuth, requireRole('RD'), async (req, res) => {
+    try {
+        const userId = req.params.id;
+        const { password } = req.body;
+        
+        const user = await User.findByPk(userId);
+        if (!user) {
+            return res.status(404).json({ error: 'User not found.' });
+        }
+
+        const updateData = req.body;
+        
+        // Prevent changing password via the generic update endpoint
+        if (password) {
+            // Note: It's safer to have a dedicated /reset-password endpoint, 
+            // but for simple admin update, we can hash it here.
+            updateData.passwordHash = await bcrypt.hash(password, 10);
+            delete updateData.password; // Remove plain password from update data
+        }
+
+        // Prevent a user from demoting or deleting their own account via PUT
+        if (parseInt(userId) === req.user.id && updateData.role && updateData.role !== req.user.role) {
+            return res.status(403).json({ error: 'Cannot change your own administrative role.' });
+        }
+
+        await user.update(updateData);
+
+        const updatedUser = await User.findByPk(userId, { attributes: { exclude: ['passwordHash'] } });
+
+        res.json({ 
+            message: 'User updated successfully.', 
+            user: updatedUser 
+        });
+    } catch (err) {
+        console.error('Error updating user:', err);
+        res.status(500).json({ error: 'Failed to update user' });
+    }
+});
+
+// DELETE /api/users/:id
+app.delete('/api/users/:id', requireAuth, requireRole('RD'), async (req, res) => {
+    try {
+        const userId = req.params.id;
+        
+        // Prevent the user from deleting their own account
+        if (parseInt(userId) === req.user.id) {
+            return res.status(403).json({ error: 'Cannot delete your own user account.' });
+        }
+
+        const deletedCount = await User.destroy({ where: { id: userId } });
+
+        if (deletedCount === 0) {
+            return res.status(404).json({ error: 'User not found.' });
+        }
+
+        // NOTE: Deleting a user who is an RA will leave residents/incidents linked
+        // to a non-existent foreign key. Real-world apps need robust cascade logic 
+        // or re-assignment logic here.
+
+        res.status(204).send(); // 204 No Content for successful deletion
+    } catch (err) {
+        console.error('Error deleting user:', err);
+        res.status(500).json({ error: 'Failed to delete user' });
+    }
+});
+
+// --------
+// RESIDENT
+// --------
+
 // GET /api/residents
 app.get('/api/residents', requireAuth, requireRole(['RA', 'RD']), async (req, res) => {
     try {
@@ -210,10 +297,9 @@ app.get('/api/residents', requireAuth, requireRole(['RA', 'RD']), async (req, re
 });
 
 // GET /api/residents/:id
-app.get('/api/residents/:id', requireAuth, requireRole('RA','RD'), async (req, res) => {
+app.get('/api/residents/:id', requireAuth, requireRole(['RA','RD']), async (req, res) => {
     try {
         const user = await Resident.findByPk(req.params.id, {
-            attributes: { exclude: ['passwordHash'] } // Never send password hash
         });
 
         if (!user) {
@@ -226,6 +312,100 @@ app.get('/api/residents/:id', requireAuth, requireRole('RA','RD'), async (req, r
         res.status(500).json({ error: 'Failed to fetch resident' });
     }
 });
+
+// POST /api/residents
+app.post('/api/residents', requireAuth, requireRole('RD'), async (req, res) => {
+    try {
+        const { name, roomNumber, building, classYear, assignedRAId } = req.body;
+
+        if (!name || !roomNumber || !building || !classYear || !assignedRAId) {
+            return res.status(400).json({ error: 'All fields (name, roomNumber, building, classYear, assignedRAId) are required.' });
+        }
+
+        // Validate that assignedRAId is a valid User with role 'RA'
+        const raUser = await User.findOne({ where: { id: assignedRAId, role: 'RA' } });
+        if (!raUser) {
+            return res.status(400).json({ error: 'Invalid or non-RA user ID provided for assignment.' });
+        }
+
+        const newResident = await Resident.create({ name, roomNumber, building, classYear, assignedRAId });
+
+        // Fetch the new resident with RA details for the response
+        const residentWithRA = await Resident.findByPk(newResident.id, {
+            include: { model: User, as: 'RA', attributes: ['id', 'name', 'email'] }
+        });
+
+        res.status(201).json({ 
+            message: 'Resident created successfully.', 
+            resident: residentWithRA 
+        });
+    } catch (err) {
+        console.error('Error creating resident:', err);
+        res.status(500).json({ error: 'Failed to create resident' });
+    }
+});
+
+// PUT /api/residents/:id
+app.put('/api/residents/:id', requireAuth, requireRole('RD'), async (req, res) => {
+    try {
+        const residentId = req.params.id;
+        const { assignedRAId } = req.body;
+        
+        const resident = await Resident.findByPk(residentId);
+        if (!resident) {
+            return res.status(404).json({ error: 'Resident not found.' });
+        }
+
+        const updateData = req.body;
+
+        // Validation for assignedRAId if it's being updated
+        if (assignedRAId) {
+            const raUser = await User.findOne({ where: { id: assignedRAId, role: 'RA' } });
+            if (!raUser) {
+                return res.status(400).json({ error: 'Invalid or non-RA user ID provided for reassignment.' });
+            }
+        }
+        
+        await resident.update(updateData);
+
+        const updatedResident = await Resident.findByPk(resident.id, {
+            include: { model: User, as: 'RA', attributes: ['id', 'name', 'email'] }
+        });
+
+        res.json({ 
+            message: 'Resident updated successfully.', 
+            resident: updatedResident 
+        });
+    } catch (err) {
+        console.error('Error updating resident:', err);
+        res.status(500).json({ error: 'Failed to update resident' });
+    }
+});
+
+// DELETE /api/residents/:id
+app.delete('/api/residents/:id', requireAuth, requireRole('RD'), async (req, res) => {
+    try {
+        const residentId = req.params.id;
+        
+        const deletedCount = await Resident.destroy({ where: { id: residentId } });
+
+        if (deletedCount === 0) {
+            return res.status(404).json({ error: 'Resident not found.' });
+        }
+
+        // NOTE: In a real app, you might also want to delete or mark related Incident Reports
+        // if the resident is deleted, depending on business rules.
+
+        res.status(204).send(); // 204 No Content for successful deletion
+    } catch (err) {
+        console.error('Error deleting resident:', err);
+        res.status(500).json({ error: 'Failed to delete resident' });
+    }
+});
+
+// ---------------
+// INCIDENT ROUTES
+// ---------------
 
 // GET /api/incidents
 app.get('/api/incidents', requireAuth, requireRole(['RA', 'RD']), async (req, res) => {
@@ -398,6 +578,39 @@ app.put('/api/incidents/:id', requireAuth, requireRole(['RA', 'RD']), async (req
     }
 });
 
+// DELETE /api/incidents/:id - DELETE an Incident Report
+app.delete('/api/incidents/:id', requireAuth, requireRole(['RA', 'RD']), async (req, res) => {
+    try {
+        const incidentId = req.params.id;
+        const userRole = req.user.role;
+        const userId = req.user.id;
+        let whereClause = { id: incidentId }; // Start by filtering for the requested ID
+
+        // **Access Control Logic**
+        // If the user is an RA, they can ONLY delete reports they created.
+        if (userRole === 'RA') {
+            whereClause.reportedById = userId; 
+        }
+        
+        // RDs can delete any report (no additional filter).
+
+        const deletedCount = await IncidentReport.destroy({ 
+            where: whereClause
+        });
+
+        if (deletedCount === 0) {
+            // Returns 404 if ID doesn't exist OR if RA lacks permission
+            return res.status(404).json({ error: 'Incident report not found or access denied.' });
+        }
+
+        res.status(204).send(); // 204 No Content for successful deletion
+
+    } catch (err) {
+        console.error('Error deleting incident report:', err);
+        res.status(500).json({ error: 'Failed to delete incident report' });
+    }
+});
+
 // ---------------------------
 // Error handling middleware
 // ---------------------------
@@ -417,3 +630,14 @@ app.listen(PORT, () => {
     console.log(`Environment: ${process.env.NODE_ENV}`);
     console.log(`Health check: http://localhost:${PORT}/health`);
 });
+
+// Only start the server if not in test environment
+if (process.env.NODE_ENV !== "test") {
+    app.listen(PORT, () => {
+        console.log(`Server running on http://localhost:${PORT}`);
+        console.log(`Environment: ${process.env.NODE_ENV}`);
+        console.log(`Health check: http://localhost:${PORT}/health`);
+    });
+}
+
+module.exports = app; // <-- Export app for testing

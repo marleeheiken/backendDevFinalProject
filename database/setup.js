@@ -1,6 +1,7 @@
 const { Sequelize, DataTypes } = require('sequelize');
 require('dotenv').config();
 
+
 // Initialize database connection
 const db = new Sequelize({
     dialect: 'sqlite',
