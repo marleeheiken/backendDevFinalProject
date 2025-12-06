@@ -1,8 +1,11 @@
 # backendDevFinalProject
 
-# Assignment #6: Course Database Assignment
+A resident and incident report API built with Express.js and SQLite. To be used by resident assistants and resident directors. 
 
-A simple course catalog management API built with Express.js and SQLite.
+
+## Postman documentation
+https://documenter.getpostman.com/view/49806553/2sB3dPTAa5
+
 
 ## Setup
 
@@ -55,7 +58,9 @@ server.js
 database/
 ├── setup.js
 ├── seed.js
-└── university.db
+└── residency.db
+tests/
+├── server.test.js
 package.json
 README.md
 ```
